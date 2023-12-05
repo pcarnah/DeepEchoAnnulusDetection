@@ -1,3 +1,5 @@
+import copy
+import json
 import os
 from pathlib import Path
 
@@ -161,20 +163,11 @@ class AnnulusRegressor(nn.Module):
                                 spatial_dims=3,
                                 num_classes=64,
                                 in_channels=1,
-                                image_size=152,
+                                image_size=198,
                                 width_coefficient=0.7,
                                 depth_coefficient=0.8)
 
         # self.reg = EfficientNetBN('efficientnet-b0', spatial_dims=3, num_classes=64, in_channels=1, pretrained=False)
-        self.regF = EfficientNet(blocks_args_str,
-                                 spatial_dims=3,
-                                 num_classes=32,
-                                 in_channels=2,
-                                 image_size=152,
-                                 width_coefficient=0.6,
-                                 depth_coefficient=0.6)
-        # self.swish = monai.networks.blocks.activation.MemoryEfficientSwish()
-
 
         # self.down_path = torch.load(Path(__file__).parent.joinpath('unet_down.md'))
 
@@ -194,7 +187,7 @@ class AnnulusRegressor(nn.Module):
         # )
         # self.flatten = torch.nn.Flatten()
         # self.hidden = FullyConnectedNet(np.product(self.final_size) * 32, 33, [128, 64], dropout=0.0)
-        self.hidden = FullyConnectedNet(64+32, 45, [32,16], dropout=0.0, act='memswish')
+        self.hidden = FullyConnectedNet(64, 45, [32,16], dropout=0.0, act='memswish')
         self.reshape = Reshape(-1,3,2)
 
     def forward(self, x_in: torch.Tensor):
@@ -202,27 +195,24 @@ class AnnulusRegressor(nn.Module):
             x_in = x_in.as_tensor()
 
         x = self.reg(x_in)
-        xF = torch.fft.fftshift(torch.fft.rfftn(x_in.float(), dim=(2,3,4), norm='forward'), dim=(2,3))
-        xF = self.regF(torch.cat([xF.real.float(), xF.imag.float()], dim=1).contiguous())
-        x = torch.cat([x, xF], dim=1).contiguous()
         # x = self.swish(x)
         # x = self.down_path(x_in)
         # x = self.conv(x)
         # x = self.flatten(x)
         x = self.hidden(x)
-        x = torch.tanh(x)
+        # x = torch.tanh(x)
 
         out = self.reshape(x[:, 3:])
 
-        mags = out[:,:,:,0] * self.scale_factor
-        angles = out[:,:,:,1] * torch.pi
+        mags = torch.sigmoid(out[:,:,:,0]) * self.scale_factor
+        angles = torch.tanh(out[:,:,:,1]) * torch.pi
 
         real = mags * torch.cos(angles)
         imag = mags * torch.sin(angles)
 
         out = torch.stack([real,imag], dim=-1)
 
-        centroid = x[:,:3].unsqueeze(1) * self.in_shape[1] * 0.5 * 0.5
+        centroid = torch.tanh(x[:,:3]).unsqueeze(1) * self.in_shape[1] * 0.5 * 0.5
         centroid = torch.stack([centroid, torch.zeros_like(centroid)], dim=-1)
 
         return torch.cat([centroid, out], dim=1)
@@ -234,12 +224,14 @@ class RandSitkEulerTransform(MapTransform, RandomizableTransform):
                  prob: float = 0.1,
                  rotate_range: Optional[Union[Sequence[Union[Tuple[float, float], float]], float]] = None,
                  translate_range: Optional[Union[Sequence[Union[Tuple[float, float], float]], float]] = None,
+                 spacing: Optional[Union[Sequence[Union[Tuple[float, float], float]], float]] = 0.5,
+                 size: Optional[Union[Sequence[Union[Tuple[float, float], float]], float]] = (192, 192, 148),
                  allow_missing_keys: bool = False) -> None:
         MapTransform.__init__(self, keys, allow_missing_keys)
         RandomizableTransform.__init__(self, prob)
 
-        self.spacing = [0.5,0.5,0.5]
-        self.origin = [-192/4,-192/4,-148/4]
+        self.spacing = monai.utils.misc.ensure_tuple_rep(spacing, 3)
+        self.origin = np.array(monai.utils.misc.ensure_tuple_rep(size, 3)) * np.array(spacing) * -0.5
 
         self.eulerTransform = sitk.Euler3DTransform()
         self.resample = sitk.ResampleImageFilter()
@@ -247,6 +239,7 @@ class RandSitkEulerTransform(MapTransform, RandomizableTransform):
         self.resample.SetOutputOrigin(self.origin)
         self.resample.SetTransform(self.eulerTransform)
         self.resample.SetInterpolator(sitk.sitkLinear)
+        self.resample.SetSize([192,192,148])
 
         self.rotate_range = rotate_range
         self.translate_range = translate_range
@@ -284,7 +277,7 @@ class RandSitkEulerTransform(MapTransform, RandomizableTransform):
         self.randomize(None)
 
         if not self._do_transform:
-            return d
+            self.resample.SetTransform(sitk.Euler3DTransform())
 
         for key in self.key_iterator(d):
             # print(key)
@@ -299,10 +292,13 @@ class RandSitkEulerTransform(MapTransform, RandomizableTransform):
             else:
                 start = timer()
                 sim = sitk.GetImageFromArray(data.squeeze().swapaxes(0,2))
-                sim.SetOrigin(self.origin)
-                sim.SetSpacing(self.spacing)
-                self.resample.SetReferenceImage(sim)
+                sim_spacing = d[key].pixdim.numpy()
+                sim_origin = data.shape[1:] * sim_spacing * -0.5
+                sim.SetOrigin(sim_origin)
+                sim.SetSpacing(sim_spacing)
+
                 sim_tr = self.resample.Execute(sim)
+                sitk.WriteImage(sim_tr, r'D:\pcarnahanfiles\AnnulusTracking\test\test.nii.gz')
                 d[key] = np.expand_dims(sitk.GetArrayFromImage(sim_tr).swapaxes(0,2), 0)
                 end = timer()
                 # print("Image: {}".format(end-start))
@@ -311,67 +307,22 @@ class RandSitkEulerTransform(MapTransform, RandomizableTransform):
 
 
 
-def get_tform():
-    device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-    # device = torch.device('cpu')
 
-    keys = ['image']
-
-    # rand_affine = RandAffined(keys, prob=0.35, mode='bilinear', rotate_range=[0.35, 0.35, 0.25],
-    #                           translate_range=[10,10,6], cache_grid=True, spatial_size=(152,152,128),
-    #                           padding_mode='zeros', device=device)
-
-    rand_flip = RandFlipd(keys, prob=0.5, spatial_axis=0)
-
-    def transform_coords(coords):
-        out = monai.utils.convert_to_numpy(coords)
-
-        if rand_flip._do_transform:
-            out = out * np.array([-1,1,1])
-
-        # if rand_affine._do_transform:
-        #     rot = rand_affine.rand_affine.rand_affine_grid.get_transformation_matrix()[:3,:3]
-        #     tr = rand_affine.rand_affine.rand_affine_grid.get_transformation_matrix()[:3,3] * 0.5
-        #     coords = rot.new_tensor(coords).to(rot.device)
-        #     out = torch.matmul(rot, coords.T)
-        #     out = out.T + tr
-
-        # np.savetxt('./test.csv', out.detach().cpu().numpy())
-        return out
-
-
-    tform = Compose([
-        LoadImaged(keys),
-        EnsureChannelFirstd(keys),
-        # Spacingd(keys, (0.5, 0.5, 0.5), diagonal=True, align_corners=True, mode='bilinear'),
-        Orientationd(keys, axcodes='RAS'),
-        ScaleIntensityd("image"),
-        # SpatialPadd(keys, spatial_size=(152,152,128)),
-        # CenterSpatialCropd(keys, roi_size=(128,128,128)),
-        # AddCoordinateChannelsd("image", (0, 1, 2)),
-        rand_flip,
-        Lambdad('label', transform_coords),
-        RandSitkEulerTransform(['image', 'label'], 0.25, [0.4,0.4,0.25], [8,8,5]),
-        # SaveImaged('image', resample=False),
-        EnsureTyped(('image', 'label'), dtype=torch.float),
-        # ToDeviced(('image', 'label'), device),
-        ToMetaTensord('image'),
-        # FromMetaTensord('image')
-    ])
-
-    return tform
 
 class DEAD:
     keys = ['image']
-    tform = get_tform()
+
+    spacing = (0.5, 0.5, 0.5)
+    size = (192, 192, 148)
+
     val_tform = Compose([
         LoadImaged(keys),
         EnsureChannelFirstd(keys),
-        # Spacingd(keys, (0.5, 0.5, 0.5), diagonal=True, align_corners=True, mode='bilinear'),
+        Spacingd(keys, spacing, align_corners=True, mode='bilinear'),
         Orientationd(keys, axcodes='RAS'),
         ScaleIntensityd("image"),
-        # SpatialPadd(keys, spatial_size=(152,152,128)),
-        # CenterSpatialCropd(keys, roi_size=(128,128,128)),
+        SpatialPadd(keys, spatial_size=size),
+        CenterSpatialCropd(keys, roi_size=size),
         # AddCoordinateChannelsd("image", (0, 1, 2)),
         EnsureTyped(('image', 'label'), dtype=torch.float),
         # FromMetaTensord('image'),
@@ -402,6 +353,59 @@ class DEAD:
     persistent_cache = Path("./persistent_cache")
 
     @classmethod
+    def tform(cls):
+        device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+        # device = torch.device('cpu')
+
+        keys = ['image']
+
+        rand_affine = RandAffined(keys, prob=0.25, mode='bilinear', rotate_range=[0.35, 0.35, 0.25],
+                                  translate_range=[10,10,6], cache_grid=True, spatial_size=(152,152,128),
+                                  padding_mode='zeros')
+
+        rand_flip = RandFlipd(keys, prob=0.5, spatial_axis=0)
+
+        def transform_coords(coords):
+            out = monai.utils.convert_to_numpy(coords)
+
+            if rand_flip._do_transform:
+                out = out * np.array([-1, 1, 1])
+
+            if rand_affine._do_transform:
+                rot = rand_affine.rand_affine.rand_affine_grid.get_transformation_matrix()[:3,:3]
+                tr = rand_affine.rand_affine.rand_affine_grid.get_transformation_matrix()[:3,3] * torch.tensor(cls.spacing)
+                coords = rot.new_tensor(coords).to(rot.device)
+                out = torch.matmul(rot, coords.T)
+                out = out.T + tr
+
+            # np.savetxt('./test.csv', out.detach().cpu().numpy())
+            print('tform')
+            return out
+
+        tform = Compose([
+            LoadImaged(keys),
+            EnsureChannelFirstd(keys),
+            # Spacingd(keys, (0.5, 0.5, 0.5), diagonal=True, align_corners=True, mode='bilinear'),
+            Orientationd(keys, axcodes='RAS'),
+            ScaleIntensityd("image"),
+            # AddCoordinateChannelsd("image", (0, 1, 2)),
+            rand_flip,
+            rand_affine,
+            Lambdad('label', transform_coords),
+            Spacingd(keys, cls.spacing, align_corners=True, mode='bilinear'),
+            SpatialPadd(keys, spatial_size=cls.size),
+            CenterSpatialCropd(keys, roi_size=cls.size),
+            # RandSitkEulerTransform(['image', 'label'], 0.25, [0.4, 0.4, 0.25], [8, 8, 5], spacing=cls.spacing, size=cls.size),
+            # SaveImaged('image', resample=False),
+            EnsureTyped(('image', 'label'), dtype=torch.float),
+            # ToDeviced(('image', 'label'), device),
+            ToMetaTensord('image'),
+            # FromMetaTensord('image')
+        ], lazy=True)
+
+        return tform
+
+    @classmethod
     def load_train_data(cls, path, use_val=False):
         train_path = Path(path).joinpath('data').joinpath('train')
 
@@ -418,6 +422,8 @@ class DEAD:
 
         d = [{"image": im, "label": np.loadtxt(seg)} for im, seg in zip(images, segs)]
 
+
+
         max_size = float('-inf')
         for x in d:
             max_size = max(max_size, x["label"].shape[0])
@@ -431,14 +437,18 @@ class DEAD:
         # else:
         #     ds = CacheDataset(d, cls.tform)
 
-        ds = Dataset(d, cls.tform)
+        # ds = Dataset(d, cls.tform())
+        ds = CacheDataset(d, cls.tform(),
+                                num_workers=None,
+                                as_contiguous=True,
+                                copy_cache=True)
         # ds = PersistentDataset(d, cls.tform, cache_dir=persistent_cache)
         if platform.system() == 'Windows':
             num_workers = 0
         else:
             num_workers = os.cpu_count()
 
-        loader = DataLoader(ds, batch_size=16, shuffle=True, num_workers=num_workers, drop_last=True, pin_memory=False)
+        loader = DataLoader(ds, batch_size=16, shuffle=True, num_workers=os.cpu_count(), drop_last=True, pin_memory=False)
 
         return loader
 
@@ -454,14 +464,15 @@ class DEAD:
         segs = sorted([str(p.absolute()) for p in path.glob("*annulus.csv")])
         d = [{"image": im, "label": np.loadtxt(seg)} for im, seg in zip(images, segs)]
 
-        if persistent:
-            ds = CacheDataset(d, cls.val_tform)
-        # if persistent and not test:
-        #     persistent_cache = cls.persistent_cache
-        #     persistent_cache.mkdir(parents=True, exist_ok=True)
-        #     ds = LMDBDataset(d, cls.val_tform, cache_dir=persistent_cache, db_name='monai_cache_val', lmdb_kwargs={'map_size': 1000000000})
-        else:
-            ds = Dataset(d, cls.val_tform)
+        # if persistent:
+        #     ds = CacheDataset(d, cls.val_tform)
+        # # if persistent and not test:
+        # #     persistent_cache = cls.persistent_cache
+        # #     persistent_cache.mkdir(parents=True, exist_ok=True)
+        # #     ds = LMDBDataset(d, cls.val_tform, cache_dir=persistent_cache, db_name='monai_cache_val', lmdb_kwargs={'map_size': 1000000000})
+        # else:
+        #     ds = Dataset(d, cls.val_tform)
+        ds = Dataset(d, cls.val_tform)
 
         if platform.system() == 'Windows':
             num_workers = 0
@@ -530,6 +541,18 @@ class DEAD:
         # F = torch.cat([torch.zeros_like(F)[:,0:1,:], F[:,1:,:]], dim=dim)
 
         points = torch.fft.irfft(F, n=n, dim=dim, norm='forward')
+
+        if points.size(-1) == 2:
+            theta = torch.linspace(0, 2 * torch.pi, n).to(F.device)
+            r = points[:, :, 0].abs()
+            polar = points[:, :, 1]
+
+            x = r * torch.cos(theta)
+            y = r * torch.sin(theta)
+            z = polar
+
+            points = torch.stack([x, y, z], dim=-1)
+
         return points
 
 
@@ -589,7 +612,8 @@ class DEAD:
         pred_sampled2 = cls.sample_spline_from_fourier(pred, 30)
 
         # Get centroids of pred and gt
-        pred_centroid = pred[:,0,:,0]
+        # pred_centroid = pred[:,0,:,0]
+        pred_centroid = pred_sampled.mean(axis=dim)
         gt_centroid = gt.mean(axis=dim)
 
         # Compute error between centroids
@@ -681,14 +705,15 @@ class DEAD:
         #
         # l = monai.losses.DiceLoss(sigmoid=True)(cdr, cdrb) + torch.nn.BCEWithLogitsLoss()(cdr, cdrb)
 
-        print("MAE: {}, Centroid: {}, circum: {}, fft_reg: {}, AngleLoss: {}".format(mae, centroid_dist, circum, fft_reg, angle_loss))
+        # print("MAE: {}, Centroid: {}, circum: {}, fft_reg: {}, AngleLoss: {}".format(mae, centroid_dist, circum, fft_reg, angle_loss))
 
         # if cls.trainer.state.epoch < 50:
         #     return mae + fft_reg
         # else:
         #     return mae + angle_loss + fft_reg + centroid_dist
-        return 2 * mae + angle_loss + 0.5*centroid_dist + 0.1*circum + fft_reg
+        # return 2 * mae + angle_loss + 0.5*centroid_dist + 0.1*circum + fft_reg
 
+        return 2 * mae + 0.5 * centroid_dist + 0.1 * circum
 
     @classmethod
     def mae_spline_loss(cls, pred, p1):
@@ -765,7 +790,7 @@ class DEAD:
 
         # loss = DiceCELoss(softmax=True, include_background=False, lambda_dice=0.5)
 
-        opt = Novograd(net.parameters(), 5e-3)
+        opt = Novograd(net.parameters(), 1e-2)
         # opt = torch.optim.Adam(net.parameters(), lr=1e-3)
         # opt = torch.optim.SGD(net.parameters(), lr=1e-2)
         # opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
@@ -773,7 +798,7 @@ class DEAD:
         # trainer = create_supervised_trainer(net, opt, loss, device, False, )
         trainer = SupervisedTrainer(
             device=cls.device,
-            max_epochs=1500,
+            max_epochs=1000,
             train_data_loader=loader,
             network=net,
             optimizer=opt,
@@ -809,7 +834,7 @@ class DEAD:
             else:
                 logdir = logdir.joinpath(str(int(dirs[-1]) + 1))
             logdir.mkdir(parents=True, exist_ok=True)
-            shutil.copy(str(Path(__file__)), str(logdir.joinpath('DEAD.py')))
+            shutil.copy(str(Path(__file__)), str(logdir.joinpath('TEEAD.py')))
 
         cls.logdir = logdir
 
@@ -977,6 +1002,31 @@ class DEAD:
                     # fmm = logdir.joinpath(Path(m['filename_or_obj']).stem + '_pred_mm.csv')
                     np.savetxt(str(f), o.detach().cpu().numpy())
                     # np.savetxt(str(fmm), pred_mm.detach().cpu().numpy())
+
+    @classmethod
+    def closed_curve_markup(cls, data):
+
+        with open(str(Path(__file__).parent.joinpath('CC.mrk.json'))) as f:
+            mk = json.load(f)
+
+        point = copy.deepcopy(mk['markups'][0]['controlPoints'][0])
+        point['visibility'] = True
+
+        mk['markups'][0]['controlPoints'] = []
+        mk['markups'][0]['type'] = 'ClosedCurve'
+
+        # Blue
+        mk['markups'][0]['display']['color'] = [0.0, 0.0, 0.5]
+        mk['markups'][0]['display']['selectedColor'] = [0.0, 0.0, 0.5]
+
+        for i, row in enumerate(data):
+            point['id'] = str(i)
+            point['position'] = row.tolist()
+
+            mk['markups'][0]['controlPoints'].append(point)
+            mk['markups'][0]['lastUsedControlPointNumber'] = str(i)
+
+        return mk
 
     @classmethod
     def handle_sigint(cls, signum, frame):
