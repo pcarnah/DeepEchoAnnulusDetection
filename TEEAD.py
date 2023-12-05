@@ -809,7 +809,7 @@ class DEAD:
             else:
                 logdir = logdir.joinpath(str(int(dirs[-1]) + 1))
             logdir.mkdir(parents=True, exist_ok=True)
-            shutil.copy(str(Path(__file__)), str(logdir.joinpath('DEAD.py')))
+            shutil.copy(str(Path(__file__)), str(logdir.joinpath('TEEAD.py')))
 
         cls.logdir = logdir
 
